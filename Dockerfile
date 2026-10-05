@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV AUDIVERIS_VERSION=5.3.1
+ENV AUDIVERIS_VERSION=5.7.0
 ENV PORT=10000
 
 RUN apt-get update && apt-get install -y \
