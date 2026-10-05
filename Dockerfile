@@ -9,15 +9,6 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     wget \
     ca-certificates \
-    openjdk-17-jre \
-    libfontconfig1 \
-    libfreetype6 \
-    libx11-6 \
-    libxext6 \
-    libxrender1 \
-    libxtst6 \
-    libxi6 \
-    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -q \
