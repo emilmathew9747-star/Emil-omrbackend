@@ -1,75 +1,142 @@
-import os, re, shutil, subprocess, tempfile, zipfile
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse
 
-app = FastAPI(title='Emil Mathew OMR Backend', version='1.0.0')
-origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','*').split(',') if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
+app = FastAPI(title="Emil Mathew OMR Backend")
 
-MAX_BYTES = 25 * 1024 * 1024
-ALLOWED = {'.pdf','.png','.jpg','.jpeg','.tif','.tiff'}
-AUDIVERIS = os.getenv('AUDIVERIS_BIN','/opt/audiveris/bin/Audiveris')
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get('/health')
+
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "service": "Emil Mathew OMR Backend",
+        "engine": "HOMR"
+    }
+
+
+@app.get("/health")
 def health():
-    return {'ok': True, 'engine': 'Audiveris', 'audiveris_exists': Path(AUDIVERIS).exists()}
+    return {
+        "status": "healthy",
+        "engine": "HOMR"
+    }
 
-def find_musicxml(folder: Path):
-    files = list(folder.rglob('*.mxl')) + list(folder.rglob('*.musicxml')) + list(folder.rglob('*.xml'))
-    if not files:
-        return None
-    # Prefer compressed MusicXML produced by Audiveris.
-    return sorted(files, key=lambda p: p.stat().st_size, reverse=True)[0]
 
-def read_musicxml(path: Path):
-    if path.suffix.lower() in {'.xml','.musicxml'}:
-        return path.read_text(encoding='utf-8', errors='replace')
-    with zipfile.ZipFile(path, 'r') as z:
-        names = [n for n in z.namelist() if n.lower().endswith(('.xml','.musicxml'))]
-        if not names:
-            raise RuntimeError('MusicXML file was produced, but no XML score was found inside it.')
-        # Ignore META-INF/container.xml when possible.
-        names.sort(key=lambda n: ('META-INF' in n, len(n)))
-        return z.read(names[0]).decode('utf-8', errors='replace')
+@app.post("/omr")
+async def convert_sheet(file: UploadFile = File(...)):
 
-def basic_xml_title(xml: str):
-    m = re.search(r'<work-title>(.*?)</work-title>', xml, re.S)
-    return re.sub('<[^>]+>', '', m.group(1)).strip() if m else 'Recognized score'
+    allowed = {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tif",
+        ".tiff"
+    }
 
-@app.post('/omr')
-async def omr(file: UploadFile = File(...)):
-    suffix = Path(file.filename or '').suffix.lower()
-    if suffix not in ALLOWED:
-        raise HTTPException(400, 'Unsupported file. Use PDF, PNG, JPG or TIFF.')
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, 'The uploaded file is empty.')
-    if len(data) > MAX_BYTES:
-        raise HTTPException(413, 'File is larger than 25 MB.')
-    if not Path(AUDIVERIS).exists():
-        raise HTTPException(500, 'Audiveris is not installed on this server.')
+    suffix = Path(file.filename or "").suffix.lower()
 
-    with tempfile.TemporaryDirectory(prefix='emil-omr-') as td:
-        root = Path(td); inp = root / ('score' + suffix); out = root / 'out'; out.mkdir()
-        inp.write_bytes(data)
-        cmd = [AUDIVERIS, '-batch', '-transcribe', '-export', '-output', str(out), str(inp)]
-        env = os.environ.copy()
-        # Keep Java within a small free-instance memory budget where possible.
-        env.setdefault('JAVA_TOOL_OPTIONS', '-Xmx384m')
-        try:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240, env=env)
-        except subprocess.TimeoutExpired:
-            raise HTTPException(504, 'OMR timed out. Try a shorter or clearer score.')
-        if proc.returncode != 0:
-            tail = (proc.stdout or '')[-3000:]
-            raise HTTPException(500, 'Audiveris could not transcribe this score. ' + tail)
-        mxl = find_musicxml(out)
-        if not mxl:
-            raise HTTPException(500, 'Audiveris finished but did not produce MusicXML. Try a clearer score.')
-        try:
-            xml = read_musicxml(mxl)
-        except Exception as e:
-            raise HTTPException(500, str(e))
-        return JSONResponse({'ok': True, 'title': basic_xml_title(xml), 'musicxml': xml, 'engine': 'Audiveris', 'version': '5.11.0'})
+    if suffix not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload PDF, PNG, JPG, JPEG, TIF or TIFF."
+        )
+
+    workdir = Path(tempfile.mkdtemp(prefix="emil_omr_"))
+
+    try:
+        input_file = workdir / f"input{suffix}"
+
+        with open(input_file, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        # HOMR works with images.
+        # Convert the first PDF page to PNG.
+        if suffix == ".pdf":
+            png_prefix = workdir / "page"
+
+            subprocess.run(
+                [
+                    "pdftoppm",
+                    "-png",
+                    "-r",
+                    "200",
+                    "-f",
+                    "1",
+                    "-singlefile",
+                    str(input_file),
+                    str(png_prefix),
+                ],
+                check=True,
+            )
+
+            input_file = workdir / "page.png"
+
+        output_dir = workdir / "output"
+        output_dir.mkdir()
+
+        result = subprocess.run(
+            [
+                "homr",
+                str(input_file),
+                "--output_dir",
+                str(output_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr or result.stdout or "HOMR failed."
+            )
+
+        musicxml_files = list(output_dir.rglob("*.musicxml"))
+
+        if not musicxml_files:
+            musicxml_files = list(output_dir.rglob("*.xml"))
+
+        if not musicxml_files:
+            raise RuntimeError(
+                "HOMR finished but did not produce a MusicXML file."
+            )
+
+        # Copy result outside the cleanup directory so Render can
+        # finish sending it before the temporary working directory is removed.
+        final_file = Path(tempfile.mktemp(suffix=".musicxml"))
+        shutil.copy2(musicxml_files[0], final_file)
+
+        return FileResponse(
+            path=str(final_file),
+            filename="emil_omr_result.musicxml",
+            media_type="application/vnd.recordare.musicxml+xml",
+        )
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="OMR processing timed out."
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    finally:
+        shutil.rmtree
